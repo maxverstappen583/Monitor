@@ -1,18 +1,16 @@
-# bot.py
-# Discord monitor bot with Flask web service + Discord interactive settings UI
+# bot.py — updated: force guild sync + /forcecheck command
 import os
 import io
 import json
-import sqlite3
-import threading
 import asyncio
+import sqlite3
 import urllib.parse
+import threading
 from datetime import datetime, timedelta
 
 import aiohttp
 import discord
 from discord.ext import tasks, commands
-from discord import app_commands
 from flask import Flask, jsonify
 from dotenv import load_dotenv
 
@@ -26,7 +24,7 @@ ONLINE_KEYWORD = os.getenv("ONLINE_KEYWORD", "Online")
 CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", "5"))
 TIMEOUT_SECONDS = int(os.getenv("TIMEOUT_SECONDS", "10"))
 QUICKCHART_URL = os.getenv("QUICKCHART_URL", "https://quickchart.io/chart")
-GUILD_ID = os.getenv("GUILD_ID", "")   # optional for quick slash register
+GUILD_ID = os.getenv("GUILD_ID", "")   # <--- set this to force guild sync (bot must be in this guild)
 DB_PATH = os.getenv("DB_PATH", "monitor.db")
 FLASK_PORT = int(os.getenv("PORT", "3000"))  # Render sets PORT env
 
@@ -72,7 +70,6 @@ def dbRun(sql, params=()):
     conn.commit()
     return c
 
-# ensure settings row
 if not dbGet("SELECT 1 FROM settings WHERE id=1"):
     dbRun("INSERT INTO settings(id) VALUES (1)")
 
@@ -92,7 +89,6 @@ def update_setting(field, value):
         raise ValueError("bad field")
     dbRun(f"UPDATE settings SET {field}=? WHERE id=1", (value,))
 
-# log helpers
 def insert_log(ts_ms, up):
     dbRun("INSERT INTO logs(ts, up) VALUES (?, ?)", (ts_ms, up))
 
@@ -104,6 +100,11 @@ def end_last_downtime(end_ts):
 
 def get_last_downtime():
     return dbGet("SELECT start_ts, end_ts FROM downtimes ORDER BY id DESC LIMIT 1")
+
+def dbAll_sync(query, params=()):
+    c = conn.cursor()
+    c.execute(query, params)
+    return c.fetchall()
 
 # ========== Flask (small web service so Render sees a port) ==========
 app = Flask("monitor_web")
@@ -130,18 +131,12 @@ def health():
 def run_flask():
     app.run(host="0.0.0.0", port=FLASK_PORT, debug=False, use_reloader=False)
 
-# ========== Discord bot (async) ==========
+# ========== Discord bot ==========
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-observed_status = None  # "online" | "offline"
+observed_status = None
 downtime_start = None
-
-async def fetch_text(url, timeout_s):
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, timeout=timeout_s) as resp:
-            text = await resp.text()
-            return resp.status, text
 
 async def notify_owners_dm(content: str, file_bytes: bytes = None, filename: str = "chart.png"):
     for uid in OWNER_IDS:
@@ -153,10 +148,11 @@ async def notify_owners_dm(content: str, file_bytes: bytes = None, filename: str
                 await user.send(content, file=discord.File(bio, filename=filename))
             else:
                 await user.send(content)
+        except discord.Forbidden:
+            print(f"Forbidden to DM {uid} (they may have DMs disabled or blocked the bot)")
         except Exception as e:
             print(f"Failed to DM {uid}: {e}")
 
-# uptime calculation
 def compute_uptime_percent(hours: int):
     now_ms = int(datetime.utcnow().timestamp() * 1000)
     since_ms = now_ms - (hours * 3600 * 1000)
@@ -167,7 +163,6 @@ def compute_uptime_percent(hours: int):
     up = sum(r[0] for r in rows)
     return round((up/total)*100, 2)
 
-# QuickChart builder
 async def build_quickchart_png(labels, values):
     cfg = {"type":"line","data":{"labels":labels,"datasets":[{"label":"Uptime %","data":values,"fill":True,"borderColor":"#39d353","backgroundColor":"rgba(57,211,83,0.08)"}]},"options":{"scales":{"y":{"min":0,"max":100}},"plugins":{"legend":{"display":False}}}}
     q = urllib.parse.quote_plus(json.dumps(cfg, separators=(",",":")))
@@ -178,8 +173,7 @@ async def build_quickchart_png(labels, values):
                 raise Exception(f"QuickChart error {resp.status}")
             return await resp.read()
 
-# monitor check
-import aiohttp
+# ========== run_check_once returns result ==========
 async def run_check_once():
     global observed_status, downtime_start
     s = get_settings()
@@ -198,41 +192,34 @@ async def run_check_once():
     insert_log(ts_ms, 1 if is_online else 0)
 
     if is_online:
+        msg = "Online"
         if observed_status != "online":
-            observed_status = "online"
+            # recovered
             if downtime_start:
                 end_ts = int(datetime.utcnow().timestamp() * 1000)
                 end_last_downtime(end_ts)
                 downtime_secs = (end_ts - downtime_start) // 1000
                 downtime_start = None
-                msg = f"✅ **Maxy is BACK ONLINE**\nDowntime: {downtime_secs}s\n{STATUS_PAGE_URL}"
+                notify_msg = f"✅ **Maxy is BACK ONLINE**\nDowntime: {downtime_secs}s\n{STATUS_PAGE_URL}"
             else:
-                msg = f"✅ **Maxy is ONLINE**\n{STATUS_PAGE_URL}"
-            await notify_owners_dm(msg)
+                notify_msg = f"✅ **Maxy is ONLINE**\n{STATUS_PAGE_URL}"
+            # notify owners
+            asyncio.create_task(notify_owners_dm(notify_msg))
             print("Owners notified: ONLINE")
+        observed_status = "online"
     else:
+        msg = "Offline"
         if observed_status != "offline":
             observed_status = "offline"
             downtime_start = int(datetime.utcnow().timestamp() * 1000)
             start_downtime(downtime_start)
-            msg = f"🔴 **Maxy is OFFLINE**\n{STATUS_PAGE_URL}\n(Keyword `{keyword}` not found or fetch error)"
-            await notify_owners_dm(msg)
+            notify_msg = f"🔴 **Maxy is OFFLINE**\n{STATUS_PAGE_URL}\n(Keyword `{keyword}` not found or fetch error)"
+            asyncio.create_task(notify_owners_dm(notify_msg))
             print("Owners notified: OFFLINE")
 
-# background loop using tasks.loop but interval read from DB
-@tasks.loop(minutes=1.0)
-async def dynamic_monitor_loop():
-    # read interval from DB and run check accordingly by counting time
-    s = get_settings()
-    interval = max(1, int(s["interval_min"]))
-    # run check now
-    await run_check_once()
-    # sleep rest intervals (done by scheduling next run by restarting loop)
-    # The tasks.loop runs every minute; we emulate flexible interval by running check only when counter % interval == 0
-    # Simpler: stop this loop and use a loop that sleeps for interval seconds. For clarity, implement manual loop below.
-    pass
+    return is_online, msg, ts_ms
 
-# We'll implement a proper manual loop instead of tasks.loop for flexible interval
+# monitor worker
 async def monitor_worker():
     await bot.wait_until_ready()
     while True:
@@ -244,7 +231,7 @@ async def monitor_worker():
             print("Monitor worker error:", e)
         await asyncio.sleep(interval_min * 60)
 
-# ========== Discord UI for settings (buttons + modals) ==========
+# ========== CLI/UI: settings view (same as before) ==========
 from discord.ui import View, Button, Modal, TextInput
 
 class EditModal(Modal):
@@ -256,7 +243,6 @@ class EditModal(Modal):
 
     async def on_submit(self, interaction: discord.Interaction):
         val = self.input.value.strip()
-        # validate numeric fields
         if self.field_name in ("interval_min","timeout_s","auto_ping_interval_s"):
             try:
                 valn = int(val)
@@ -274,7 +260,6 @@ class SettingsView(View):
         self.inviter_id = inviter_id
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        # only allow the command invoker or owners to interact
         return interaction.user.id == self.inviter_id or interaction.user.id in OWNER_IDS
 
     @discord.ui.button(label="Edit Channel ID", style=discord.ButtonStyle.primary)
@@ -302,18 +287,13 @@ class SettingsView(View):
         modal = EditModal("auto_ping_url", "Auto ping URL (blank to disable)", "https://example.com/keepalive")
         await interaction.response.send_modal(modal)
 
-    @discord.ui.button(label="Auto Ping Interval (s)", style=discord.ButtonStyle.secondary)
-    async def edit_autoping_interval(self, button: Button, interaction: discord.Interaction):
-        modal = EditModal("auto_ping_interval_s", "Auto ping interval (seconds)", "300")
-        await interaction.response.send_modal(modal)
-
     @discord.ui.button(label="Show current", style=discord.ButtonStyle.success)
     async def show_current(self, button: Button, interaction: discord.Interaction):
         s = get_settings()
         lines = [f"{k}: {v}" for k,v in s.items()]
-        await interaction.response.send_message("Current settings:\\n" + "\\n".join(lines), ephemeral=True)
+        await interaction.response.send_message("Current settings:\n" + "\n".join(lines), ephemeral=True)
 
-# ========== Slash commands: /health and /status and /settings ==========
+# ========== slash commands: /health, /status, /settings, /forcecheck ==========
 @bot.tree.command(name="health", description="Show Maxy health (chart + text).")
 async def health(interaction: discord.Interaction):
     await interaction.response.defer()
@@ -327,8 +307,6 @@ async def health(interaction: discord.Interaction):
             last_inc_str = f"{datetime.fromtimestamp(s_ts/1000).strftime('%c')}" + (f" → {datetime.fromtimestamp(e_ts/1000).strftime('%c')}" if e_ts else " (ongoing)")
         else:
             last_inc_str = "No incidents"
-
-        # prepare hourly chart for last 24h
         now = datetime.utcnow()
         labels, values = [], []
         for i in range(23, -1, -1):
@@ -342,15 +320,12 @@ async def health(interaction: discord.Interaction):
             else:
                 total = len(rows); upcount = sum(r[0] for r in rows)
                 values.append(round((upcount/total) * 100, 2))
-
         chart_png = await build_quickchart_png(labels, values)
-        text = f"Maxy health summary\\n24h: {u24}% • 7d: {u7}% • 30d: {u30}%\\n{last_inc_str}"
+        text = f"Maxy health summary\n24h: {u24}% • 7d: {u7}% • 30d: {u30}%\n{last_inc_str}"
         file = discord.File(io.BytesIO(chart_png), filename="health.png")
         embed = discord.Embed(title="Maxy Health", description=text)
         embed.set_image(url="attachment://health.png")
         await interaction.followup.send(embed=embed, file=file)
-
-        # DM owners the same
         await notify_owners_dm(text, file_bytes=chart_png, filename="health.png")
     except Exception as e:
         print("health error:", e)
@@ -369,14 +344,12 @@ async def status(interaction: discord.Interaction):
             last_inc_str = f"{datetime.fromtimestamp(s_ts/1000).strftime('%c')}" + (f" → {datetime.fromtimestamp(e_ts/1000).strftime('%c')}" if e_ts else " (ongoing)")
         else:
             last_inc_str = "No incidents"
-
         last_row = dbAll("SELECT ts, up FROM logs ORDER BY ts DESC LIMIT 1")
         if last_row:
             last_check = datetime.fromtimestamp(last_row[0][0]/1000).strftime('%c')
             last_up = "ONLINE" if last_row[0][1] == 1 else "OFFLINE"
         else:
             last_check = "N/A"; last_up = "N/A"
-
         color = discord.Color.green() if last_up == "ONLINE" else discord.Color.red()
         embed = discord.Embed(title="Maxy Quick Status", color=color)
         embed.add_field(name="Current", value=last_up, inline=True)
@@ -392,7 +365,6 @@ async def status(interaction: discord.Interaction):
 
 @bot.tree.command(name="settings", description="Open interactive settings UI (owners only).")
 async def settings(interaction: discord.Interaction):
-    # allow only owners or the guild admin? we restrict to OWNER_IDS
     if interaction.user.id not in OWNER_IDS:
         await interaction.response.send_message("You are not allowed to use this command.", ephemeral=True)
         return
@@ -403,37 +375,91 @@ async def settings(interaction: discord.Interaction):
     view = SettingsView(inviter_id=interaction.user.id)
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
-# prefix fallbacks
-@bot.command(name="health")
-async def health_cmd(ctx):
-    await ctx.send("Generating health summary...")
-    # call the slash handler logic simplified
-    await health.callback(bot.tree, ctx)  # reuse
+# ========== NEW: /forcecheck (owner-only) ==========
+@bot.tree.command(name="forcecheck", description="Force an immediate check (owners only).")
+async def forcecheck(interaction: discord.Interaction):
+    if interaction.user.id not in OWNER_IDS:
+        await interaction.response.send_message("You are not allowed to use this command.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        is_online, msg, ts_ms = await run_check_once()
+        last_check = datetime.fromtimestamp(ts_ms/1000).strftime('%c')
+        color = discord.Color.green() if is_online else discord.Color.red()
+        embed = discord.Embed(title="Force Check Result", color=color)
+        embed.add_field(name="Status", value=("ONLINE" if is_online else "OFFLINE"), inline=True)
+        embed.add_field(name="Checked at", value=last_check, inline=True)
+        # show last incident summary
+        last_inc = get_last_downtime()
+        if last_inc:
+            s_ts, e_ts = last_inc
+            if e_ts:
+                last_inc_str = f"{datetime.fromtimestamp(s_ts/1000).strftime('%c')} → {datetime.fromtimestamp(e_ts/1000).strftime('%c')}"
+            else:
+                last_inc_str = f"Ongoing since {datetime.fromtimestamp(s_ts/1000).strftime('%c')}"
+        else:
+            last_inc_str = "No incidents"
+        embed.add_field(name="Last incident", value=last_inc_str, inline=False)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    except Exception as e:
+        print("/forcecheck error:", e)
+        await interaction.followup.send("Error running check.", ephemeral=True)
 
-@bot.command(name="status")
-async def status_cmd(ctx):
-    await ctx.invoke(bot.tree.get_command("status"))
+# prefix fallback commands
+@bot.command(name="forcecheck")
+async def forcecheck_cmd(ctx):
+    if ctx.author.id not in OWNER_IDS:
+        await ctx.send("You are not allowed to use this command.")
+        return
+    await ctx.send("Running force check...")
+    try:
+        is_online, msg, ts_ms = await run_check_once()
+        last_check = datetime.fromtimestamp(ts_ms/1000).strftime('%c')
+        color = 0x2ecc71 if is_online else 0xe74c3c
+        embed = discord.Embed(title="Force Check Result", color=color)
+        embed.add_field(name="Status", value=("ONLINE" if is_online else "OFFLINE"), inline=True)
+        embed.add_field(name="Checked at", value=last_check, inline=True)
+        last_inc = get_last_downtime()
+        if last_inc:
+            s_ts, e_ts = last_inc
+            if e_ts:
+                last_inc_str = f"{datetime.fromtimestamp(s_ts/1000).strftime('%c')} → {datetime.fromtimestamp(e_ts/1000).strftime('%c')}"
+            else:
+                last_inc_str = f"Ongoing since {datetime.fromtimestamp(s_ts/1000).strftime('%c')}"
+        else:
+            last_inc_str = "No incidents"
+        embed.add_field(name="Last incident", value=last_inc_str, inline=False)
+        await ctx.send(embed=embed)
+    except Exception as e:
+        print("!forcecheck error:", e)
+        await ctx.send("Error running check.")
 
-# ========== start tasks & run ==========
+# ========== bot events: on_ready with forced guild sync ==========
 @bot.event
 async def on_ready():
-    print("Bot ready:", bot.user)
-    # sync commands
+    print(f"Bot ready: {bot.user} Owners: {OWNER_IDS}")
     try:
         if GUILD_ID:
-            await bot.tree.sync(guild=discord.Object(id=int(GUILD_ID)))
-            print("Synced commands to guild", GUILD_ID)
+            try:
+                gid = int(GUILD_ID)
+                await bot.tree.sync(guild=discord.Object(id=gid))
+                print("Synced commands to guild", GUILD_ID)
+            except Exception as e:
+                print("Guild sync failed:", e, "— falling back to global sync")
+                await bot.tree.sync()
+                print("Synced global commands")
         else:
             await bot.tree.sync()
             print("Synced global commands")
     except Exception as e:
-        print("Slash sync failed:", e)
+        print("Slash sync final fallback failed:", e)
 
-    # launch monitor worker in the background (async)
+    # start the monitor worker
     bot.loop.create_task(monitor_worker())
 
-# run flask in thread then run bot
+# ========== start everything ==========
 if __name__ == "__main__":
+    # run flask in background thread for Render port detection
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     bot.run(BOT_TOKEN)
