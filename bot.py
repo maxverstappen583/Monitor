@@ -1,4 +1,11 @@
-# bot.py - Monitor bot (website keyword check) + Flask web service + slash commands
+# bot.py
+# Monitor bot: fetches a website HTML and checks for a keyword (no site changes required).
+# Runs a Flask web service so Render detects a port, stores logs in SQLite,
+# notifies multiple owners via DM, provides /health, /status, /forcecheck, /settings.
+
+from dotenv import load_dotenv
+load_dotenv()  # MUST be first so os.getenv() reads .env when running locally
+
 import os
 import io
 import json
@@ -11,70 +18,76 @@ from datetime import datetime, timedelta
 import aiohttp
 import discord
 from discord.ext import commands, tasks
+from discord import app_commands
 from flask import Flask, jsonify
-from dotenv import load_dotenv
 
-load_dotenv()
-
-# ========== ENV ========== (fill these in Render or .env)
+# ----------------- CONFIG / ENV (Render or .env) -----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWNER_USER_IDS = os.getenv("OWNER_USER_IDS", "")   # comma-separated user IDs who receive DMs
-GUILD_ID = os.getenv("GUILD_ID", "")               # set to your guild id to force guild sync (bot must be in it)
-CHECK_URL = os.getenv("CHECK_URL")                 # website to fetch (no site changes required)
+OWNER_USER_IDS = os.getenv("OWNER_USER_IDS", "")   # comma-separated owner IDs
+GUILD_ID = os.getenv("GUILD_ID", "")               # optional (force guild sync)
+CHECK_URL = os.getenv("CHECK_URL")                 # site to check (must include https://)
 ONLINE_KEYWORD = os.getenv("ONLINE_KEYWORD", "Online")
 CHECK_INTERVAL_MIN = int(os.getenv("CHECK_INTERVAL_MIN", "5"))
 REQUEST_TIMEOUT_S = int(os.getenv("REQUEST_TIMEOUT_S", "10"))
 QUICKCHART_URL = os.getenv("QUICKCHART_URL", "https://quickchart.io/chart")
 DB_PATH = os.getenv("DB_PATH", "monitor.db")
-FLASK_PORT = int(os.getenv("PORT", "3000"))       # Render provides PORT
+FLASK_PORT = int(os.getenv("PORT", "3000"))       # Render supplies PORT
 
+# Basic verification
 if not BOT_TOKEN or not OWNER_USER_IDS or not CHECK_URL:
     print("ERROR: BOT_TOKEN, OWNER_USER_IDS and CHECK_URL must be set")
+    print("DEBUG ENV VALUES:",
+          "BOT_TOKEN:", bool(os.getenv("BOT_TOKEN")),
+          "OWNER_USER_IDS:", os.getenv("OWNER_USER_IDS"),
+          "CHECK_URL:", os.getenv("CHECK_URL"))
     raise SystemExit(1)
 
 OWNER_IDS = [int(x.strip()) for x in OWNER_USER_IDS.split(",") if x.strip()]
 
-# ========== SQLite DB (settings, logs, downtimes) ==========
+# ----------------- SQLITE (settings, logs, downtimes) -----------------
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 cur = conn.cursor()
-cur.execute("""CREATE TABLE IF NOT EXISTS settings (
-    id INTEGER PRIMARY KEY CHECK(id=1),
-    interval_min INTEGER DEFAULT ?,
-    timeout_s INTEGER DEFAULT ?,
-    response_keyword TEXT DEFAULT ?,
-    channel_id TEXT DEFAULT ''
-)""", (CHECK_INTERVAL_MIN, REQUEST_TIMEOUT_S, ONLINE_KEYWORD))
-# Above uses parameterized defaults for portability; if table existed this has no effect
 
-# create logs & downtimes
+cur.execute("""
+CREATE TABLE IF NOT EXISTS settings (
+  id INTEGER PRIMARY KEY CHECK(id=1),
+  interval_min INTEGER DEFAULT ?,
+  timeout_s INTEGER DEFAULT ?,
+  response_keyword TEXT DEFAULT ?,
+  channel_id TEXT DEFAULT ''
+)
+""", (CHECK_INTERVAL_MIN, REQUEST_TIMEOUT_S, ONLINE_KEYWORD))
+
 cur.execute("CREATE TABLE IF NOT EXISTS logs (ts INTEGER, up INTEGER)")
-cur.execute("""CREATE TABLE IF NOT EXISTS downtimes (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    start_ts INTEGER,
-    end_ts INTEGER
-)""")
+cur.execute("""
+CREATE TABLE IF NOT EXISTS downtimes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  start_ts INTEGER,
+  end_ts INTEGER
+)
+""")
 conn.commit()
 
-# ensure single settings row
+# ensure single settings row exists
 r = cur.execute("SELECT COUNT(*) FROM settings WHERE id=1").fetchone()
 if r is None or r[0] == 0:
     cur.execute("INSERT INTO settings(id, interval_min, timeout_s, response_keyword) VALUES (1, ?, ?, ?)",
                 (CHECK_INTERVAL_MIN, REQUEST_TIMEOUT_S, ONLINE_KEYWORD))
     conn.commit()
 
-def db_get(sql, params=()):
+def db_get(q, params=()):
     c = conn.cursor()
-    c.execute(sql, params)
+    c.execute(q, params)
     return c.fetchone()
 
-def db_all(sql, params=()):
+def db_all(q, params=()):
     c = conn.cursor()
-    c.execute(sql, params)
+    c.execute(q, params)
     return c.fetchall()
 
-def db_run(sql, params=()):
+def db_run(q, params=()):
     c = conn.cursor()
-    c.execute(sql, params)
+    c.execute(q, params)
     conn.commit()
     return c
 
@@ -90,7 +103,7 @@ def get_settings():
 def update_setting(field, value):
     if field not in ("interval_min","timeout_s","response_keyword","channel_id"):
         raise ValueError("bad field")
-    db_run(f"UPDATE settings SET {field} = ? WHERE id=1", (value,))
+    db_run(f"UPDATE settings SET {field}=? WHERE id=1", (value,))
 
 def insert_log(ts_ms, up):
     db_run("INSERT INTO logs(ts, up) VALUES (?, ?)", (ts_ms, up))
@@ -99,20 +112,17 @@ def start_downtime(start_ts):
     db_run("INSERT INTO downtimes(start_ts, end_ts) VALUES (?, NULL)", (start_ts,))
 
 def end_last_downtime(end_ts):
-    db_run("UPDATE downtimes SET end_ts = ? WHERE id = (SELECT id FROM downtimes ORDER BY id DESC LIMIT 1)", (end_ts,))
+    db_run("UPDATE downtimes SET end_ts=? WHERE id=(SELECT id FROM downtimes ORDER BY id DESC LIMIT 1)", (end_ts,))
 
 def get_last_downtime():
     return db_get("SELECT start_ts, end_ts FROM downtimes ORDER BY id DESC LIMIT 1")
 
-def db_logs_since(ms_since):
+def logs_since(ms_since):
     return db_all("SELECT ts, up FROM logs WHERE ts >= ? ORDER BY ts ASC", (ms_since,))
 
-# ========== Flask app for Render port detection and simple API ==========
+# ----------------- Flask for Render port detection & lightweight API -----------------
 flask_app = Flask("monitor_web")
-
-# expose a small JSON endpoint describing the observed status + last check
-# OBSERVED_STATUS is updated by the monitor loop
-OBSERVED_STATUS = {"online": False, "last_check_ts": None, "last_msg": None}
+OBSERVED_STATUS = {"online": False, "last_check_ts": None}
 
 @flask_app.route("/")
 def index():
@@ -131,22 +141,23 @@ def health():
 def run_flask():
     flask_app.run(host="0.0.0.0", port=FLASK_PORT, debug=False, use_reloader=False)
 
-# ========== Discord bot ==========
+# ----------------- Discord bot (intents first) -----------------
 intents = discord.Intents.default()
-# set message_content to True only to silence the warning; not required for slash commands
+# set to True to silence the "privileged intent missing" warning; safe if you need message content
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-observed_status = None     # "online" or "offline" or None initially
+observed_status = None   # "online" or "offline"
 downtime_start = None
 
-# ---------- HTTP helpers ----------
+# ---------- HTTP helper ----------
 async def fetch_text(url, timeout_s):
     async with aiohttp.ClientSession() as session:
         async with session.get(url, timeout=timeout_s) as resp:
-            txt = await resp.text()
-            return resp.status, txt
+            text = await resp.text()
+            return resp.status, text
 
+# ---------- notify owners ----------
 async def notify_owners_dm(content: str, file_bytes: bytes = None, filename: str = "chart.png"):
     for uid in OWNER_IDS:
         try:
@@ -162,33 +173,33 @@ async def notify_owners_dm(content: str, file_bytes: bytes = None, filename: str
         except Exception as e:
             print(f"[WARN] Failed to DM {uid}: {e}")
 
-# ---------- uptime calculations ----------
+# ---------- uptime helpers ----------
 def uptime_percent(hours: int):
     now_ms = int(datetime.utcnow().timestamp() * 1000)
     since_ms = now_ms - (hours * 3600 * 1000)
-    rows = db_logs_since(since_ms)
+    rows = logs_since(since_ms)
     if not rows:
         return 100.0
     total = len(rows)
     up = sum(r[1] for r in rows)
     return round((up / total) * 100, 2)
 
-# ---------- QuickChart image builder ----------
+# ---------- QuickChart builder ----------
 async def build_quickchart_png(labels, values):
     cfg = {
-        "type": "line",
-        "data": {"labels": labels, "datasets":[{"label":"Uptime %","data":values,"fill":True,"borderColor":"#39d353","backgroundColor":"rgba(57,211,83,0.08)"}]},
-        "options": {"scales": {"y": {"min":0,"max":100}}, "plugins":{"legend":{"display":False}}}
+        "type":"line",
+        "data":{"labels":labels,"datasets":[{"label":"Uptime %","data":values,"fill":True,"borderColor":"#39d353","backgroundColor":"rgba(57,211,83,0.08)"}]},
+        "options":{"scales":{"y":{"min":0,"max":100}},"plugins":{"legend":{"display":False}}}
     }
     q = urllib.parse.quote_plus(json.dumps(cfg, separators=(",",":")))
     url = f"{QUICKCHART_URL}?c={q}&format=png&width=800&height=300"
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as resp:
             if resp.status != 200:
-                raise Exception(f"QuickChart returned {resp.status}")
+                raise Exception(f"QuickChart error {resp.status}")
             return await resp.read()
 
-# ---------- core check - returns tuple (is_online:bool, message:str, ts_ms:int) ----------
+# ---------- core check ----------
 async def run_check_once():
     global observed_status, downtime_start, OBSERVED_STATUS
     s = get_settings()
@@ -204,40 +215,35 @@ async def run_check_once():
     ts_ms = int(datetime.utcnow().timestamp() * 1000)
     insert_log(ts_ms, 1 if found else 0)
 
-    # update observed global for Flask endpoint
     OBSERVED_STATUS["online"] = bool(found)
     OBSERVED_STATUS["last_check_ts"] = ts_ms
-    OBSERVED_STATUS["last_msg"] = None
 
     if found:
-        # recovered or stays online
         if observed_status != "online":
-            # was offline -> now recovered
+            # recovery
             if downtime_start:
                 end_ts = ts_ms
                 end_last_downtime(end_ts)
                 downtime_secs = (end_ts - downtime_start) // 1000
                 downtime_start = None
-                msg = f"✅ Maxy BACK ONLINE (downtime {downtime_secs}s)\n{CHECK_URL}"
+                notify_msg = f"✅ Maxy BACK ONLINE — downtime {downtime_secs}s\n{CHECK_URL}"
             else:
-                msg = f"✅ Maxy ONLINE\n{CHECK_URL}"
-            # notify owners asynchronously
-            asyncio.create_task(notify_owners_dm(msg))
+                notify_msg = f"✅ Maxy ONLINE\n{CHECK_URL}"
+            asyncio.create_task(notify_owners_dm(notify_msg))
             print("Owners notified: ONLINE")
         observed_status = "online"
         return True, "ONLINE", ts_ms
     else:
-        # detected offline
         if observed_status != "offline":
             observed_status = "offline"
             downtime_start = ts_ms
             start_downtime(downtime_start)
-            msg = f"🔴 Maxy OFFLINE (keyword not found)\n{CHECK_URL}"
-            asyncio.create_task(notify_owners_dm(msg))
+            notify_msg = f"🔴 Maxy OFFLINE (keyword not found)\n{CHECK_URL}"
+            asyncio.create_task(notify_owners_dm(notify_msg))
             print("Owners notified: OFFLINE")
         return False, "OFFLINE", ts_ms
 
-# ---------- monitor worker (reads interval from settings) ----------
+# ---------- monitor worker ----------
 async def monitor_worker():
     await bot.wait_until_ready()
     while True:
@@ -249,7 +255,7 @@ async def monitor_worker():
             print("Monitor worker error:", e)
         await asyncio.sleep(interval_min * 60)
 
-# ---------- Discord UI: Settings (modals & buttons) ----------
+# ---------- Discord interactive UI (modals & view) ----------
 from discord.ui import View, Button, Modal, TextInput
 
 class EditModal(Modal):
@@ -298,8 +304,8 @@ class SettingsView(View):
         lines = [f"{k}: {v}" for k,v in s.items()]
         await interaction.response.send_message("Current settings:\n" + "\n".join(lines), ephemeral=True)
 
-# ---------- Slash commands (/health, /status, /settings, /forcecheck) ----------
-@bot.tree.command(name="health", description="Show Maxy health summary (chart + text).")
+# ---------- Slash commands ----------
+@bot.tree.command(name="health", description="Show Maxy health (chart + text).")
 async def health(interaction: discord.Interaction):
     await interaction.response.defer()
     try:
@@ -312,7 +318,7 @@ async def health(interaction: discord.Interaction):
             last_inc_str = f"{datetime.fromtimestamp(s_ts/1000).strftime('%c')}" + (f" → {datetime.fromtimestamp(e_ts/1000).strftime('%c')}" if e_ts else " (ongoing)")
         else:
             last_inc_str = "No incidents"
-        # hourly buckets last 24 hours
+
         now = datetime.utcnow()
         labels = []
         values = []
@@ -327,13 +333,13 @@ async def health(interaction: discord.Interaction):
             else:
                 total = len(rows); upcount = sum(r[0] for r in rows)
                 values.append(round((upcount/total) * 100, 2))
+
         chart_png = await build_quickchart_png(labels, values)
         text = f"Maxy health\n24h: {u24}% • 7d: {u7}% • 30d: {u30}%\n{last_inc_str}"
         file = discord.File(io.BytesIO(chart_png), filename="health.png")
         embed = discord.Embed(title="Maxy Health", description=text)
         embed.set_image(url="attachment://health.png")
         await interaction.followup.send(embed=embed, file=file)
-        # DM owners
         await notify_owners_dm(text, file_bytes=chart_png, filename="health.png")
     except Exception as e:
         print("health error:", e)
@@ -439,7 +445,7 @@ async def forcecheck_cmd(ctx):
     embed.add_field(name="Last incident", value=last_inc_str, inline=False)
     await ctx.send(embed=embed)
 
-# ========== on_ready: force guild sync if requested, start monitor ==========
+# ---------- on_ready: force guild sync (if provided) & start monitor ----------
 @bot.event
 async def on_ready():
     print(f"Bot ready: {bot.user} Owners: {OWNER_IDS}")
@@ -450,7 +456,7 @@ async def on_ready():
                 await bot.tree.sync(guild=discord.Object(id=gid))
                 print("Synced commands to guild", GUILD_ID)
             except Exception as e:
-                print("Guild sync failed:", e, "falling back to global sync")
+                print("Guild sync failed:", e, "— falling back to global sync")
                 await bot.tree.sync()
                 print("Synced global commands")
         else:
@@ -458,10 +464,9 @@ async def on_ready():
             print("Synced global commands")
     except Exception as e:
         print("Slash sync failed:", e)
-    # start monitor worker
     bot.loop.create_task(monitor_worker())
 
-# ========== start Flask thread & run bot ==========
+# ---------- start Flask thread and run bot ----------
 if __name__ == "__main__":
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
